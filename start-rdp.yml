@@ -1,0 +1,228 @@
+name: Start PrivateRDP Runner
+
+on:
+  workflow_dispatch:
+    inputs:
+      room_code:
+        description: "Room code used by your PrivateRDP APK"
+        required: true
+        default: "PRIVATE-RDP-2026"
+      keep_minutes:
+        description: "How long to keep the runner alive (GitHub-hosted max is limited)"
+        required: true
+        type: choice
+        options: ['60', '180', '330']
+        default: '330'
+      audio:
+        description: "Enable WASAPI/Opus desktop audio (may add CPU/latency)"
+        type: boolean
+        required: false
+        default: false
+
+jobs:
+  rdp:
+    runs-on: windows-latest
+    timeout-minutes: 355
+    permissions:
+      contents: read
+    env:
+      RDP_SIGNAL_URL: wss://universal-usb-signal.reiseakari.workers.dev/ws
+      RDP_ROOM: ${{ inputs.room_code }}
+      RDP_ICE_SERVERS_JSON: ${{ secrets.RDP_ICE_SERVERS_JSON }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install low-latency WebRTC host
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+          # PowerShell normally doesn't fail a step just because a native EXE exits non-zero.
+          # Make pip/python failures fatal so a green Install step always means dependencies exist.
+          $PSNativeCommandUseErrorActionPreference = $true
+
+          python -m pip install --upgrade --disable-pip-version-check pip
+          if ($LASTEXITCODE -ne 0) { throw 'pip bootstrap failed' }
+
+          # Self-contained install: do NOT depend on requirements.txt being uploaded to GitHub.
+          python -m pip install --disable-pip-version-check --quiet `
+            "aiortc==1.15.0" `
+            "mss==10.2.0" `
+            "numpy>=2.0,<3" `
+            "websockets>=14,<16" `
+            "PyAudioWPatch==0.2.12.8"
+          if ($LASTEXITCODE -ne 0) { throw 'core WebRTC dependency install failed' }
+
+          # DXCam/WinRT is preferred, but MSS fallback can still bring the host up.
+          python -m pip install --disable-pip-version-check --quiet "dxcam[winrt]==0.3.0"
+          if ($LASTEXITCODE -ne 0) { Write-Warning 'DXCam install failed; host will try MSS fallback' }
+
+          python -c "import av, aiortc, mss, numpy, websockets; print('CORE_IMPORT_OK', aiortc.__version__)"
+          if ($LASTEXITCODE -ne 0) { throw 'WebRTC Python preflight import failed' }
+
+          foreach ($svc in @('AudioEndpointBuilder','Audiosrv')) {
+            try { Set-Service $svc -StartupType Automatic -ErrorAction SilentlyContinue } catch {}
+            try { Start-Service $svc -ErrorAction SilentlyContinue } catch {}
+          }
+          @'
+          from pathlib import Path
+          import re
+          import aiortc.codecs.h264 as h264
+          p = Path(h264.__file__)
+          text = p.read_text(encoding='utf-8')
+          if '"preset": "ultrafast"' not in text:
+              needle = '"tune": "zerolatency",'
+              if needle not in text:
+                  raise SystemExit('aiortc H264 zerolatency patch point not found')
+              text = text.replace(needle, needle + '\n                "preset": "ultrafast",', 1)
+          text = re.sub(r'DEFAULT_BITRATE\s*=\s*1000000(?:\s*#.*)?', 'DEFAULT_BITRATE = 4500000  # PrivateRDP start', text, count=1)
+          text = re.sub(r'MIN_BITRATE\s*=\s*500000(?:\s*#.*)?', 'MIN_BITRATE = 1200000  # PrivateRDP floor', text, count=1)
+          text = re.sub(r'MAX_BITRATE\s*=\s*3000000(?:\s*#.*)?', 'MAX_BITRATE = 10000000  # PrivateRDP hard ceiling', text, count=1)
+          p.write_text(text, encoding='utf-8')
+          compile(text, str(p), 'exec')
+          print('H264 patched:', p)
+          '@ | python -
+          python -m py_compile desktop-host/rdp_webrtc_host.py rdp_signal_bridge.py
+          if ($LASTEXITCODE -ne 0) { throw 'PrivateRDP source compile preflight failed' }
+
+      - name: Set 1600x720 desktop mode
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Continue'
+          Add-Type -TypeDefinition @'
+          using System;
+          using System.Runtime.InteropServices;
+          public static class PrivateRdpDisplayMode {
+            [StructLayout(LayoutKind.Sequential, CharSet=CharSet.Ansi)]
+            public struct DEVMODE {
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmDeviceName;
+              public short dmSpecVersion, dmDriverVersion, dmSize, dmDriverExtra;
+              public int dmFields, dmPositionX, dmPositionY, dmDisplayOrientation, dmDisplayFixedOutput;
+              public short dmColor, dmDuplex, dmYResolution, dmTTOption, dmCollate;
+              [MarshalAs(UnmanagedType.ByValTStr, SizeConst=32)] public string dmFormName;
+              public short dmLogPixels;
+              public int dmBitsPerPel, dmPelsWidth, dmPelsHeight, dmDisplayFlags, dmDisplayFrequency;
+              public int dmICMMethod, dmICMIntent, dmMediaType, dmDitherType, dmReserved1, dmReserved2, dmPanningWidth, dmPanningHeight;
+            }
+            [DllImport("user32.dll", CharSet=CharSet.Ansi)] static extern bool EnumDisplaySettings(string n, int i, ref DEVMODE d);
+            [DllImport("user32.dll", CharSet=CharSet.Ansi)] static extern int ChangeDisplaySettings(ref DEVMODE d, int f);
+            const int CURRENT=-1, W=0x80000, H=0x100000;
+            static DEVMODE Fresh(){ var d=new DEVMODE(); d.dmSize=(short)Marshal.SizeOf(typeof(DEVMODE)); return d; }
+            public static string Current(){ var d=Fresh(); return EnumDisplaySettings(null,CURRENT,ref d)?$"{d.dmPelsWidth}x{d.dmPelsHeight}@{d.dmDisplayFrequency}":"unknown"; }
+            public static string Set(int w,int h){
+              DEVMODE best=Fresh(); bool found=false; int hz=-1;
+              for(int i=0;;i++){ var d=Fresh(); if(!EnumDisplaySettings(null,i,ref d)) break; if(d.dmPelsWidth==w&&d.dmPelsHeight==h&&d.dmDisplayFrequency>=hz){best=d;hz=d.dmDisplayFrequency;found=true;} }
+              if(!found){ if(!EnumDisplaySettings(null,CURRENT,ref best)) return "enum-failed"; best.dmPelsWidth=w; best.dmPelsHeight=h; best.dmFields|=W|H; }
+              int r=ChangeDisplaySettings(ref best,0); return $"result={r} actual={Current()}";
+            }
+          }
+          '@
+          Write-Host "Display before: $([PrivateRdpDisplayMode]::Current())"
+          Write-Host "Display set: $([PrivateRdpDisplayMode]::Set(1600,720))"
+
+      - name: Run PrivateRDP
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $room = (($env:RDP_ROOM -replace '[^A-Za-z0-9]','').ToUpperInvariant())
+          if ($room.Length -lt 12) { throw 'room_code must contain at least 12 alphanumeric characters' }
+          $env:RDP_ROOM = $room
+          $env:RDP_DESKTOP_WIDTH = '1600'
+          $env:RDP_DESKTOP_HEIGHT = '720'
+          $env:RDP_DESKTOP_OS_WIDTH = '1600'
+          $env:RDP_DESKTOP_OS_HEIGHT = '720'
+          $env:RDP_DESKTOP_FPS = '60'
+          $env:RDP_DESKTOP_AUDIO = if ('${{ inputs.audio }}' -eq 'true') { '1' } else { '0' }
+          $env:RDP_DESKTOP_IPC_PORT = '8765'
+          $env:DXCAM_WINRT_CURSOR_CAPTURE = '0'
+          $env:DXCAM_WINRT_BORDER_REQUIRED = '0'
+          $env:DXCAM_WINRT_FRAME_WAIT_MS = '0'
+          $env:DXCAM_WINRT_MIN_UPDATE_INTERVAL_MS = '0'
+          $env:DXCAM_WINRT_FRAME_POOL_SIZE = '2'
+
+          $hostOut = Join-Path $env:RUNNER_TEMP 'private-rdp-host.out.log'
+          $hostErr = Join-Path $env:RUNNER_TEMP 'private-rdp-host.err.log'
+          $sigOut  = Join-Path $env:RUNNER_TEMP 'private-rdp-signal.out.log'
+          $sigErr  = Join-Path $env:RUNNER_TEMP 'private-rdp-signal.err.log'
+
+          function Dump-Host-Logs {
+            Write-Host '===== PrivateRDP host STDOUT ====='
+            Get-Content $hostOut -Tail 160 -ErrorAction SilentlyContinue
+            Write-Host '===== PrivateRDP host STDERR ====='
+            Get-Content $hostErr -Tail 160 -ErrorAction SilentlyContinue
+          }
+          function Start-Host {
+            Remove-Item $hostOut,$hostErr -Force -ErrorAction SilentlyContinue
+            $python = (Get-Command python).Source
+            Write-Host "Starting host with: $python"
+            $p = Start-Process $python -ArgumentList @('-u','desktop-host/rdp_webrtc_host.py') -WindowStyle Hidden -RedirectStandardOutput $hostOut -RedirectStandardError $hostErr -PassThru
+            $deadline=(Get-Date).AddSeconds(25); $ok=$false
+            while((Get-Date)-lt $deadline){
+              Start-Sleep -Milliseconds 350
+              $p.Refresh()
+              if($p.HasExited){
+                Write-Host "Host exited early with code $($p.ExitCode)"
+                break
+              }
+              try {
+                $tcp=New-Object Net.Sockets.TcpClient
+                $ar=$tcp.BeginConnect('127.0.0.1',8765,$null,$null)
+                if($ar.AsyncWaitHandle.WaitOne(500) -and $tcp.Connected){$ok=$true}
+                $tcp.Close()
+              } catch {}
+              if($ok){break}
+            }
+            if(-not $ok){ Dump-Host-Logs; throw 'desktop host failed to start (see host log above)' }
+            Write-Host "Desktop host IPC ready pid=$($p.Id)"
+            try { (Get-Process -Id $p.Id).PriorityClass='High' } catch {}
+            return $p
+          }
+          function Start-Signal {
+            Remove-Item $sigOut,$sigErr -Force -ErrorAction SilentlyContinue
+            $python = (Get-Command python).Source
+            $p=Start-Process $python -ArgumentList @('-u','rdp_signal_bridge.py') -WindowStyle Hidden -RedirectStandardOutput $sigOut -RedirectStandardError $sigErr -PassThru
+            Start-Sleep 2
+            $p.Refresh()
+            if($p.HasExited){
+              Write-Host "Signaling bridge exited early with code $($p.ExitCode)"
+              Write-Host '===== signaling STDOUT ====='
+              Get-Content $sigOut -Tail 160 -ErrorAction SilentlyContinue
+              Write-Host '===== signaling STDERR ====='
+              Get-Content $sigErr -Tail 160 -ErrorAction SilentlyContinue
+              throw 'signaling bridge failed to start'
+            }
+            try { (Get-Process -Id $p.Id).PriorityClass='AboveNormal' } catch {}
+            return $p
+          }
+
+          $host=Start-Host
+          $sig=Start-Signal
+          Write-Host '=============================================='
+          Write-Host ' PRIVATE RDP READY'
+          Write-Host " Room       : $room"
+          Write-Host ' Stream     : 1600x720 @ target 60 FPS'
+          Write-Host ' Video cap  : adaptive H264, max 10 Mbps'
+          Write-Host ' Auth token : NONE (private room signaling)'
+          Write-Host " Audio      : $env:RDP_DESKTOP_AUDIO"
+          Write-Host '=============================================='
+
+          $end=(Get-Date).AddMinutes([int]'${{ inputs.keep_minutes }}')
+          $nextLog=(Get-Date).AddSeconds(20)
+          while((Get-Date)-lt $end){
+            Start-Sleep 2
+            $host.Refresh(); $sig.Refresh()
+            if($host.HasExited){ Write-Warning 'desktop host exited; restarting'; Get-Content $hostErr -Tail 80 -ErrorAction SilentlyContinue; $host=Start-Host }
+            if($sig.HasExited){ Write-Warning 'signaling bridge exited; restarting'; Get-Content $sigErr -Tail 80 -ErrorAction SilentlyContinue; $sig=Start-Signal }
+            if((Get-Date)-ge $nextLog){
+              Write-Host '--- host diagnostic tail ---'
+              Get-Content $hostErr -Tail 12 -ErrorAction SilentlyContinue
+              Write-Host '--- signaling tail ---'
+              Get-Content $sigErr -Tail 8 -ErrorAction SilentlyContinue
+              $nextLog=(Get-Date).AddSeconds(30)
+            }
+          }
+          Stop-Process -Id $sig.Id -Force -ErrorAction SilentlyContinue
+          Stop-Process -Id $host.Id -Force -ErrorAction SilentlyContinue
